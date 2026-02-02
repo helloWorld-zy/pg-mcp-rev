@@ -149,21 +149,22 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
 
-        # SQL Validator
+        # SQL Validator (with security config from settings)
         sql_validator = SQLValidator(
             config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
+            blocked_tables=_settings.security.blocked_tables,
+            blocked_columns=_settings.security.blocked_columns,
+            allow_explain=_settings.security.allow_explain,
         )
 
-        # SQL Executor (create one per database)
+        # SQL Executor (create one per database with resilience config)
         sql_executors: dict[str, SQLExecutor] = {}
         for db_name, pool in _pools.items():
             executor = SQLExecutor(
                 pool=pool,
                 security_config=_settings.security,
                 db_config=_settings.database,
+                resilience_config=_settings.resilience,
             )
             sql_executors[db_name] = executor
             logger.info(f"Created SQL executor for database '{db_name}'")
@@ -189,12 +190,12 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             llm_limit=5,  # Can be made configurable
         )
 
-        # 8. Create QueryOrchestrator
+        # 8. Create QueryOrchestrator (with all executors for multi-database support)
         logger.info("Creating query orchestrator...")
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
             sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            sql_executors=sql_executors,  # Pass all executors for multi-database support
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,
@@ -352,9 +353,14 @@ async def query(
             },
         }
 
-    # Execute query through orchestrator
+    # Execute query through orchestrator with rate limiting
     try:
-        response: QueryResponse = await _orchestrator.execute_query(request)
+        # Apply rate limiting for queries
+        if _rate_limiter is not None:
+            async with _rate_limiter.for_queries(timeout=30.0):
+                response: QueryResponse = await _orchestrator.execute_query(request)
+        else:
+            response = await _orchestrator.execute_query(request)
         result = response.to_dict()
         # Ensure tokens_used is always present
         if "tokens_used" not in result:

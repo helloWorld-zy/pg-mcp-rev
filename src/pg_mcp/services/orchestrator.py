@@ -67,7 +67,7 @@ class QueryOrchestrator:
         self,
         sql_generator: SQLGenerator,
         sql_validator: SQLValidator,
-        sql_executor: SQLExecutor,
+        sql_executors: dict[str, SQLExecutor],
         result_validator: ResultValidator,
         schema_cache: SchemaCache,
         pools: dict[str, Pool],
@@ -79,7 +79,7 @@ class QueryOrchestrator:
         Args:
             sql_generator: SQL generation service.
             sql_validator: SQL validation service.
-            sql_executor: SQL execution service.
+            sql_executors: Dictionary mapping database names to SQL executors.
             result_validator: Result validation service.
             schema_cache: Schema cache instance.
             pools: Dictionary mapping database names to connection pools.
@@ -88,7 +88,7 @@ class QueryOrchestrator:
         """
         self.sql_generator = sql_generator
         self.sql_validator = sql_validator
-        self.sql_executor = sql_executor
+        self.sql_executors = sql_executors
         self.result_validator = result_validator
         self.schema_cache = schema_cache
         self.pools = pools
@@ -191,17 +191,26 @@ class QueryOrchestrator:
                     tokens_used=tokens_used,
                 )
 
-            # Step 5: Execute SQL
-            logger.debug("Executing SQL", extra={"request_id": request_id})
+            # Step 5: Get the correct executor for this database
+            sql_executor = self.sql_executors.get(database_name)
+            if sql_executor is None:
+                raise DatabaseError(
+                    message=f"No SQL executor available for database '{database_name}'",
+                    details={"database": database_name, "available": list(self.sql_executors.keys())},
+                )
+
+            # Step 6: Execute SQL
+            logger.debug("Executing SQL", extra={"request_id": request_id, "database": database_name})
             start_time = self._get_current_time_ms()
 
-            results, total_count = await self.sql_executor.execute(generated_sql)
+            results, total_count = await sql_executor.execute(generated_sql)
 
             execution_time_ms = self._get_current_time_ms() - start_time
             logger.info(
                 "SQL executed successfully",
                 extra={
                     "request_id": request_id,
+                    "database": database_name,
                     "row_count": total_count,
                     "execution_time_ms": execution_time_ms,
                 },

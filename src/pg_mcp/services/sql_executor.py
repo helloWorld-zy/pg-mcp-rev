@@ -1,20 +1,38 @@
 """SQL executor for PostgreSQL queries.
 
 This module provides safe SQL execution with session parameter configuration,
-result serialization, and row limiting to prevent memory overflow.
+result serialization, row limiting, and retry logic for transient errors.
 """
 
 import asyncio
 import datetime
 import decimal
+import logging
 import uuid
 from typing import Any
 
 import asyncpg
 from asyncpg import Connection, Pool
 
-from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
+from pg_mcp.config.settings import DatabaseConfig, ResilienceConfig, SecurityConfig
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
+
+logger = logging.getLogger(__name__)
+
+# Transient PostgreSQL error codes that warrant retry
+RETRYABLE_ERROR_CODES = {
+    "08000",  # Connection exception
+    "08003",  # Connection does not exist
+    "08006",  # Connection failure
+    "08001",  # SQL client unable to establish connection
+    "08004",  # Server rejected connection
+    "40001",  # Serialization failure
+    "40P01",  # Deadlock detected
+    "53300",  # Too many connections
+    "57P01",  # Admin shutdown
+    "57P02",  # Crash shutdown
+    "57P03",  # Cannot connect now
+}
 
 
 class SQLExecutor:
@@ -25,6 +43,7 @@ class SQLExecutor:
     2. Running queries in read-only transactions
     3. Limiting the number of returned rows
     4. Serializing PostgreSQL-specific data types
+    5. Retrying on transient errors with exponential backoff
 
     Example:
         >>> executor = SQLExecutor(pool, security_config, db_config)
@@ -37,6 +56,7 @@ class SQLExecutor:
         pool: Pool,
         security_config: SecurityConfig,
         db_config: DatabaseConfig,
+        resilience_config: ResilienceConfig | None = None,
     ) -> None:
         """Initialize SQL executor.
 
@@ -44,10 +64,22 @@ class SQLExecutor:
             pool: asyncpg connection pool for database connections.
             security_config: Security configuration including timeouts and limits.
             db_config: Database configuration including connection parameters.
+            resilience_config: Optional resilience config for retry behavior.
         """
         self.pool = pool
         self.security_config = security_config
         self.db_config = db_config
+        self.resilience_config = resilience_config
+
+        # Retry configuration with defaults
+        if resilience_config:
+            self.max_retries = resilience_config.max_retries
+            self.retry_delay = resilience_config.retry_delay
+            self.backoff_factor = resilience_config.backoff_factor
+        else:
+            self.max_retries = 3
+            self.retry_delay = 1.0
+            self.backoff_factor = 2.0
 
     async def execute(
         self,
@@ -55,15 +87,16 @@ class SQLExecutor:
         timeout: float | None = None,  # noqa: ASYNC109
         max_rows: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Execute SQL query with security measures.
+        """Execute SQL query with security measures and retry logic.
 
         This method:
         1. Acquires a connection from the pool
         2. Starts a read-only transaction
         3. Sets session parameters (timeout, search_path, role)
         4. Executes the query with timeout
-        5. Limits the number of returned rows
-        6. Serializes special PostgreSQL types
+        5. Retries on transient errors with exponential backoff
+        6. Limits the number of returned rows
+        7. Serializes special PostgreSQL types
 
         Args:
             sql: SQL query to execute (should already be validated).
@@ -77,7 +110,7 @@ class SQLExecutor:
 
         Raises:
             ExecutionTimeoutError: If query execution exceeds timeout.
-            DatabaseError: If database operation fails.
+            DatabaseError: If database operation fails after all retries.
 
         Example:
             >>> results, count = await executor.execute(
@@ -91,66 +124,107 @@ class SQLExecutor:
         timeout = timeout or self.security_config.max_execution_time
         max_rows = max_rows or self.security_config.max_rows
 
-        try:
-            async with (
-                self.pool.acquire() as connection,
-                connection.transaction(readonly=True),
-            ):
-                # Set session parameters for security
-                await self._set_session_params(connection, timeout)
+        last_error: Exception | None = None
+        delay = self.retry_delay
 
-                # Execute query with timeout
-                try:
-                    records = await asyncio.wait_for(
-                        connection.fetch(sql),
-                        timeout=timeout,
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await self._execute_once(sql, timeout, max_rows)
+            except ExecutionTimeoutError:
+                # Don't retry timeouts
+                raise
+            except asyncpg.PostgresError as e:
+                # Check if this is a retryable error
+                error_code = getattr(e, "sqlstate", None)
+                if error_code in RETRYABLE_ERROR_CODES and attempt < self.max_retries:
+                    logger.warning(
+                        f"Retryable database error (attempt {attempt + 1}/{self.max_retries + 1}): {e}",
+                        extra={"error_code": error_code, "retry_delay": delay},
                     )
-                except TimeoutError as e:
-                    raise ExecutionTimeoutError(
-                        message=f"Query execution exceeded timeout of {timeout} seconds",
-                        details={
-                            "timeout_seconds": timeout,
-                            "sql": sql[:200],  # Include truncated SQL for debugging
-                        },
-                    ) from e
+                    last_error = e
+                    await asyncio.sleep(delay)
+                    delay *= self.backoff_factor
+                    continue
+                # Not retryable or out of retries
+                raise DatabaseError(
+                    message=f"Database query failed: {e!s}",
+                    details={
+                        "error_code": error_code,
+                        "error_message": str(e),
+                        "sql": sql[:200],
+                        "attempts": attempt + 1,
+                    },
+                ) from e
+            except Exception as e:
+                # Don't retry unexpected errors
+                raise DatabaseError(
+                    message=f"Unexpected error during query execution: {e!s}",
+                    details={
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                    },
+                ) from e
 
-                # Track total count before limiting
-                total_count = len(records)
-
-                # Limit number of returned rows
-                if len(records) > max_rows:
-                    records = records[:max_rows]
-
-                # Convert asyncpg.Record to dict
-                results = [dict(record) for record in records]
-
-                # Serialize special PostgreSQL types
-                results = self._serialize_results(results)
-
-                return results, total_count
-
-        except ExecutionTimeoutError:
-            # Re-raise timeout errors as-is
-            raise
-        except asyncpg.PostgresError as e:
-            # Wrap PostgreSQL errors
+        # Should not reach here, but handle just in case
+        if last_error:
             raise DatabaseError(
-                message=f"Database query failed: {e!s}",
-                details={
-                    "error_code": e.sqlstate if hasattr(e, "sqlstate") else None,
-                    "error_message": str(e),
-                    "sql": sql[:200],  # Include truncated SQL for debugging
-                },
-            ) from e
-        except Exception as e:
-            # Catch-all for unexpected errors
-            raise DatabaseError(
-                message=f"Unexpected error during query execution: {e!s}",
-                details={
-                    "error_type": type(e).__name__,
-                    "error_message": str(e),
-                },
-            ) from e
+                message=f"Database query failed after {self.max_retries + 1} attempts: {last_error!s}",
+                details={"attempts": self.max_retries + 1},
+            ) from last_error
+        raise DatabaseError(message="Query execution failed unexpectedly")
+
+    async def _execute_once(
+        self,
+        sql: str,
+        timeout: float,  # noqa: ASYNC109
+        max_rows: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Execute SQL query once without retry logic.
+
+        Args:
+            sql: SQL query to execute.
+            timeout: Query timeout in seconds.
+            max_rows: Maximum rows to return.
+
+        Returns:
+            tuple: (results, total_row_count)
+        """
+        async with (
+            self.pool.acquire() as connection,
+            connection.transaction(readonly=True),
+        ):
+            # Set session parameters for security
+            await self._set_session_params(connection, timeout)
+
+            # Execute query with timeout
+            try:
+                records = await asyncio.wait_for(
+                    connection.fetch(sql),
+                    timeout=timeout,
+                )
+            except TimeoutError as e:
+                raise ExecutionTimeoutError(
+                    message=f"Query execution exceeded timeout of {timeout} seconds",
+                    details={
+                        "timeout_seconds": timeout,
+                        "sql": sql[:200],
+                    },
+                ) from e
+
+            # Track total count before limiting
+            total_count = len(records)
+
+            # Limit number of returned rows
+            if len(records) > max_rows:
+                records = records[:max_rows]
+
+            # Convert asyncpg.Record to dict
+            results = [dict(record) for record in records]
+
+            # Serialize special PostgreSQL types
+            results = self._serialize_results(results)
+
+            return results, total_count
 
     async def _set_session_params(
         self,
